@@ -1,0 +1,9 @@
+venv/
+.venv/
+__pycache__/
+.DS_Store
+.streamlit/secrets.toml
+output/
+*.xlsx
+!example.xlsx
+*.zip

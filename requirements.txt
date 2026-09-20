@@ -1,0 +1,6 @@
+streamlit==1.64.0
+docxtpl==0.20.2
+pandas==2.3.3
+openpyxl==3.1.5
+lxml>=5.3,<7
+Jinja2>=3.1.6,<4
