@@ -50,20 +50,35 @@ def specialty_code(group):
     return match.group(1) if match else ''
 
 
+def normalize_name(value):
+    """Одинаковый регистр ФИО, включая двойные фамилии и инициалы."""
+    return clean(value).title()
+
+
+def normalize_label(value):
+    """Обычный регистр названий с сохранением известных сокращений."""
+    acronyms = {'ит', 'it', 'ict', 'эвм', 'cad', 'cam', 'чпу'}
+    text = clean(value).lower()
+    text = text[:1].upper() + text[1:]
+    return re.sub(r'[^\W\d_]+',
+                  lambda m: m.group().upper() if m.group().casefold() in acronyms else m.group(),
+                  text)
+
+
 def short_name(value):
-    parts = clean(value).split()
+    parts = normalize_name(value).split()
     return parts[0] + (' ' + ''.join(p[0] + '.' for p in parts[1:]) if len(parts) > 1 else '') if parts else ''
 
 
 def person(name, phone):
-    name, phone = clean(name), clean(phone)
+    name, phone = normalize_name(name), clean(phone)
     return f'{name} ({phone})' if phone else name
 
 
 def context(row):
-    return dict(student_name=clean(row['ФИО Студента']), course=clean(row['Курс']),
-                group=clean(row['Группа']), group_numbers=specialty_code(row['Группа']),
-                spec=clean(row['Специальность']), faculty=clean(row['Факультет']),
+    return dict(student_name=normalize_name(row['ФИО Студента']).upper(), course=clean(row['Курс']),
+                group=clean(row['Группа']).lower(), group_numbers=specialty_code(row['Группа']),
+                spec=normalize_label(row['Специальность']), faculty=normalize_label(row['Факультет']),
                 curator_info=person(row['ФИО Куратора'], row['Телефон Куратора']),
                 zam_dekan_info=person(row['ФИО Зам. декана'], row['Телефон Зам. декана']),
                 dekan_info=person(row['ФИО Декана'], row['Телефон Декана']),
@@ -81,7 +96,9 @@ def read_excel(upload):
     df = pd.read_excel(upload, dtype=str, keep_default_na=False, engine='openpyxl', nrows=MAX_ROWS + 1)
     if len(df) > MAX_ROWS:
         raise ValueError(f'Допустимо до {MAX_ROWS:,} строк первого листа. Разделите Excel.')
-    df.columns = [ALIASES.get(clean(c), clean(c)) for c in df.columns]
+    column_names = {c.casefold(): c for c in COLUMNS}
+    column_names.update({c.casefold(): canonical for c, canonical in ALIASES.items()})
+    df.columns = [column_names.get(clean(c).casefold(), clean(c)) for c in df.columns]
     if df.columns.duplicated().any():
         raise ValueError('После переименования обнаружены повторяющиеся колонки.')
     missing = [c for c in COLUMNS if c not in df]

@@ -21,9 +21,24 @@ def run():
     for empty in [None, float('nan'), '', '  ', pd.NA]:
         assert app.person('Иванов Иван', empty) == 'Иванов Иван'
     assert app.person('Иванов Иван', '123') == 'Иванов Иван (123)'
-    df = app.read_excel(BytesIO(Path('/Users/mehrona/Downloads/таблица.xlsx').read_bytes()))
+    record = dict(zip(app.COLUMNS, [
+        '  аКРАМчонЗОДА   фИРДАВСЧОН ', '1', '1.53.01.05ТБ',
+        'ҳАРАКАТДИҲАНДАҲОИ АВТОМАТИИ БАРҚӢ', 'фАКУЛТЕТИ ЭНЕРГЕТИКА',
+        'нУРИДДИНОВА зАРИНА дАВРОНОВНА', '92-884-00-85',
+        'рАҲМАТУЛЛОЕВА мАРҲАБО мАҲМУДОВНА', '92-717-10-55',
+        'мӮМИНОВА шОҲЗОДАХОН нАЗИП', '92-915-10-02']))
+    stream = BytesIO()
+    pd.DataFrame([record]).rename(columns=str.swapcase).to_excel(stream, index=False)
+    stream.seek(0)
+    df = app.read_excel(stream)
     assert len(df) == 1
     assert app.context(df.iloc[0])['group_numbers'] == '1.53.01.05'
+    ctx = app.context(df.iloc[0])
+    assert ctx['student_name'] == 'АКРАМЧОНЗОДА ФИРДАВСЧОН'
+    assert ctx['group'] == '1.53.01.05тб'
+    assert ctx['faculty'] == 'Факултети энергетика'
+    assert ctx['curator_info'] == 'Нуриддинова Зарина Давроновна (92-884-00-85)'
+    assert ctx['dekan_short'] == 'Мӯминова Ш.Н.'
     for group, expected in [('344', '344'), ('344аб', '344'), ('1.53.01.05тб', '1.53.01.05'), (' 01.02тб ', '01.02'), ('12AB', '12')]:
         assert app.specialty_code(group) == expected
     rows = df.to_dict('records') * 3
@@ -38,11 +53,18 @@ def run():
         root = etree.fromstring(z.read('word/document.xml'))
         text = ''.join(root.itertext())
         assert '{{' not in text and '()' not in text
-        assert text.index('Тестовый1 Иван') < text.index('Тестовый2 Иван') < text.index('Тестовый3 Иван')
+        assert text.index('ТЕСТОВЫЙ1 ИВАН') < text.index('ТЕСТОВЫЙ2 ИВАН') < text.index('ТЕСТОВЫЙ3 ИВАН')
         assert 'Энергетика & <автоматика>' in text
         assert len(root.findall('.//' + app.W + 'sectPr')) == 1
         assert len(root.findall('.//' + app.W + 'pageBreakBefore')) == 2
         assert z.testzip() is None
+        for r in root.iter(app.W + 'r'):
+            value = ''.join(r.itertext(app.W + 't'))
+            if value in ['1', '1.53.01.05тб', ctx['curator_info']]:
+                props = r.find(app.W + 'rPr')
+                assert props.find(app.W + 'b') is not None
+                assert props.find(app.W + 'i').get(app.W + 'val') == '1'
+                assert props.find(app.W + 'u').get(app.W + 'val') == 'single'
     # Ошибки обязательных полей должны обнаруживаться до генерации.
     df.loc[0,'ФИО Студента'] = ''
     stream = BytesIO(); df.to_excel(stream, index=False); stream.seek(0)
