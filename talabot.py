@@ -3,6 +3,7 @@ from copy import deepcopy
 from datetime import date
 from io import BytesIO
 from pathlib import Path
+import hashlib
 import re
 from zipfile import ZipFile, ZIP_DEFLATED
 
@@ -54,7 +55,7 @@ def generate(data, template_bytes=None):
         raise ValueError('В списке отсутствующих допустимо до 10 студентов.')
     for field in ('form_code', 'group', 'date', 'curator', 'deputy'):
         if not data.get(field, '').strip():
-            raise ValueError('Заполните код бланка, группу, дату и ФИО ответственных.')
+            raise ValueError('Заполните код факультета, группу, дату и ФИО ответственных.')
     values = students + absent + [data[k] for k in ('form_code', 'group', 'date', 'curator', 'deputy')]
     if any(re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', value) for value in values):
         raise ValueError('В тексте обнаружены недопустимые управляющие символы.')
@@ -170,8 +171,12 @@ def main():
         st.error('Отсутствует template_talabot.docx рядом с app.py.')
         return
     excel_example = BytesIO()
-    pd.DataFrame(columns=['Ному насаби донишҷӯ', 'Гурӯҳ']).to_excel(excel_example, index=False)
+    pd.DataFrame(columns=['Ному насаби донишҷӯ', 'Гурӯҳ', 'Код факультета', 'Дата', 'ФИО Куратора', 'ФИО Заместителя', 'Отсутствует']).to_excel(excel_example, index=False)
     st.download_button('Скачать пустую таблицу Excel для Талабот', excel_example.getvalue(), file_name='Талабот_ҷадвали_холӣ.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', on_click='ignore')
+    mode = st.radio('Режим генерации', ['Одна группа', 'Несколько групп'], horizontal=True)
+    if mode == 'Несколько групп':
+        batch_main()
+        return
     upload = st.file_uploader('Excel со списком студентов (.xlsx)', type=['xlsx'], key='talabot_excel')
     imported = ''
     if upload is not None:
@@ -199,7 +204,7 @@ def main():
             st.error(f'Не удалось прочитать Excel: {error}')
             return
     with st.form('talabot_form'):
-        code = st.text_input('Код бланка', value='ФЭ_11')
+        code = st.text_input('Код факультета', value='ФЭ_11')
         group = st.text_input('Группа', value='1_53.01.05тб')
         when = st.date_input('Дата ознакомления', value=date(2025, 10, 10))
         curator = st.text_input('Фамилия и имя — куратори гурӯҳи академӣ')
@@ -215,4 +220,128 @@ def main():
         except Exception as error:
             st.error(f'Не удалось создать документ: {error}')
     if st.session_state.get('talabot_result'):
-        st.download_button('Скачать заполненный Талабот', st.session_state.talabot_result, file_name='Талабот_саҳифаи_2.docx', mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document', on_click='ignore')
+        st.download_button('Скачать заполненный Талабот', st.session_state.talabot_result, file_name='Талабот.docx', mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document', on_click='ignore')
+
+
+BATCH_FIELDS = ['Группа', 'Код факультета', 'Дата', 'ФИО Куратора', 'ФИО Заместителя']
+
+
+def read_batch_excel(contents):
+    if len(contents) > 20 * 1024 * 1024:
+        raise ValueError('Размер Excel должен быть не более 20 МБ.')
+    with ZipFile(BytesIO(contents)) as archive:
+        if sum(item.file_size for item in archive.infolist()) > 100 * 1024 * 1024:
+            raise ValueError('Распакованный Excel превышает 100 МБ.')
+    df = pd.read_excel(BytesIO(contents), dtype=str, keep_default_na=False, nrows=100001)
+    if len(df) > 100000:
+        raise ValueError('Допустимо до 100 000 строк. Разделите Excel.')
+    aliases = {
+        'ному насаби донишҷӯ': 'ФИО Студента', 'фио': 'ФИО Студента',
+        'ному насаб': 'ФИО Студента', 'гурӯҳ': 'Группа', 'гурух': 'Группа',
+        'куратори гурӯҳ': 'ФИО Куратора',
+        'фио зам. декана': 'ФИО Заместителя',
+        'муовини декан оид ба тарбия': 'ФИО Заместителя',
+        'муовини директор оид ба тарбия': 'ФИО Заместителя',
+    }
+    aliases.update({c.casefold(): c for c in ['ФИО Студента', *BATCH_FIELDS, 'Отсутствует']})
+    df.columns = [aliases.get(str(c).strip().casefold(), str(c).strip()) for c in df.columns]
+    if df.columns.duplicated().any():
+        raise ValueError('В Excel повторяются названия колонок.')
+    for column in ('ФИО Студента', 'Группа'):
+        if column not in df:
+            raise ValueError(f'В Excel отсутствует колонка «{column}».')
+    df = df.map(lambda value: str(value).strip())
+    df = df.loc[df.ne('').any(axis=1)].copy()
+    if df.empty:
+        raise ValueError('В Excel нет студентов.')
+    bad = df[['ФИО Студента', 'Группа']].eq('').any(axis=1)
+    if bad.any():
+        raise ValueError('Заполните ФИО и группу в строках: ' + ', '.join(str(i + 2) for i in df.index[bad][:20]))
+    if 'Отсутствует' in df:
+        allowed = {'', 'да', 'нет', '1', '0', 'yes', 'no', 'true', 'false', '+', '-'}
+        if not df['Отсутствует'].str.casefold().isin(allowed).all():
+            raise ValueError('В колонке «Отсутствует» укажите «да», «нет» или оставьте пусто.')
+    return df
+
+
+def batch_settings(df):
+    settings = []
+    for group, rows in df.groupby('Группа', sort=False):
+        item = {'Группа': group}
+        for field in BATCH_FIELDS[1:]:
+            values = list(dict.fromkeys(value for value in rows[field] if value)) if field in rows else []
+            if len(values) > 1:
+                raise ValueError(f'Группа {group}: разные значения в колонке «{field}». Укажите одно значение для группы.')
+            value = values[0] if values else ''
+            if field == 'Дата' and value:
+                value = pd.to_datetime(value, dayfirst=True, errors='raise').strftime('%d.%m.%Y')
+            item[field] = value
+        settings.append(item)
+    return pd.DataFrame(settings, columns=BATCH_FIELDS)
+
+
+def generate_batch(df, settings, progress=lambda done, total: None):
+    """One separate DOCX per group, numbered ZIP entries avoid name collisions."""
+    if len(settings) != len(df['Группа'].unique()) or settings['Группа'].duplicated().any() or set(settings['Группа']) != set(df['Группа']):
+        raise ValueError('Настройки должны содержать каждую группу ровно один раз.')
+    archive = BytesIO()
+    template_bytes = TEMPLATE.read_bytes()
+    with ZipFile(archive, 'w', ZIP_DEFLATED) as output:
+        for index, item in enumerate(settings.to_dict('records'), 1):
+            group = item['Группа']
+            rows = df.loc[df['Группа'] == group]
+            missing = [field for field in BATCH_FIELDS if pd.isna(item[field]) or not str(item[field]).strip()]
+            if missing:
+                raise ValueError(f'Группа {group}: заполните ' + ', '.join(missing))
+            when = pd.to_datetime(str(item['Дата']), dayfirst=True, errors='raise').strftime('%d.%m.%Y')
+            absent = rows.loc[rows['Отсутствует'].str.casefold().isin({'да', '1', 'yes', 'true', '+'}), 'ФИО Студента'].tolist() if 'Отсутствует' in rows else []
+            data = dict(form_code=str(item['Код факультета']).strip(), group=group, date=when, curator=str(item['ФИО Куратора']).strip(), deputy=str(item['ФИО Заместителя']).strip(), students=rows['ФИО Студента'].tolist(), absent=absent)
+            try:
+                document = generate(data, template_bytes)
+            except ValueError as error:
+                raise ValueError(f'Группа {group}: {error}') from error
+            name = re.sub(r'[^\w.-]', '_', group)[:80]
+            output.writestr(f'Талабот_{index:03d}_{name}.docx', document)
+            if archive.tell() > 64 * 1024 * 1024:
+                raise ValueError('Архив превышает 64 МБ. Разделите Excel на несколько файлов.')
+            progress(index, len(settings))
+    return archive.getvalue()
+
+
+def batch_main():
+    st.write('Загрузите Excel со всеми группами. Одна строка — один студент; колонка группы обязательна.')
+    st.caption('Данные ответственных можно заполнить в Excel или в настройках ниже. «Отсутствует»: да/нет; отсутствующий остаётся и в основном списке.')
+    upload = st.file_uploader('Excel для нескольких групп (.xlsx)', type=['xlsx'], key='talabot_batch_excel')
+    if upload is None:
+        return
+    try:
+        df = read_batch_excel(upload.getvalue())
+        settings = batch_settings(df)
+    except Exception as error:
+        st.error(f'Не удалось прочитать Excel: {error}')
+        return
+    selected = st.multiselect('Группы для генерации', settings['Группа'].tolist(), default=settings['Группа'].tolist())
+    if not selected:
+        st.info('Выберите хотя бы одну группу.')
+        return
+    df = df.loc[df['Группа'].isin(selected)]
+    settings = settings.loc[settings['Группа'].isin(selected)]
+    st.info(f'Студентов: {len(df)}. Документов: {len(settings)}.')
+    with st.form('talabot_batch_form'):
+        st.write('Настройки каждого документа')
+        edited = st.data_editor(settings, hide_index=True, disabled=['Группа'], num_rows='fixed', key='talabot_batch_settings')
+        submitted = st.form_submit_button('Сгенерировать все документы', type='primary')
+    identity = hashlib.sha256(upload.getvalue() + edited.to_csv(index=False).encode()).hexdigest()
+    if st.session_state.get('talabot_batch_identity') != identity:
+        st.session_state.pop('talabot_batch_result', None)
+    if submitted:
+        st.session_state.pop('talabot_batch_result', None)
+        bar = st.progress(0.0)
+        try:
+            st.session_state.talabot_batch_result = generate_batch(df, edited, lambda done, total: bar.progress(done / total))
+            st.session_state.talabot_batch_identity = identity
+            st.success(f'Готово документов: {len(edited)}.')
+        except Exception as error:
+            st.error(f'Не удалось создать документы: {error}')
+    if st.session_state.get('talabot_batch_result'):
+        st.download_button('Скачать все документы ZIP', st.session_state.talabot_batch_result, file_name='Талабот_все_группы.zip', mime='application/zip', on_click='ignore')
