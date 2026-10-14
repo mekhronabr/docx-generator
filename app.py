@@ -244,6 +244,11 @@ def generate_part(rows, template_bytes, output, progress=lambda n, total: None):
 def main():
     st.set_page_config(page_title='Генератор Огоҳинома', page_icon='📄')
     st.title('Макрос')
+    template_kind = st.selectbox('Шаблон документа', ['Огоҳинома', 'Талабот — саҳифаи 2'])
+    if template_kind == 'Талабот — саҳифаи 2':
+        from talabot import main as talabot_main
+        talabot_main()
+        return
     st.write('1. Скачайте пустую таблицу с колонками на таджикском языке.')
     excel_template = BASE / 'example.xlsx'
     if excel_template.exists():
