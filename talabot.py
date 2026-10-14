@@ -114,7 +114,44 @@ def render_root(data, template_bytes):
     for control in list(root.iter(W + 'sdt')):
         tag = control.find(W + 'sdtPr/' + W + 'tag').get(W + 'val')
         fill_slot(control, slots[tag], formats.get(tag))
+    compact_document_tail(root)
     return root
+
+
+def compact_document_tail(root):
+    """Keep Word's final table paragraph from overflowing onto an empty page."""
+    for paragraph in root.iter(W + 'p'):
+        if ''.join(paragraph.itertext()).strip() or any(paragraph.find('.//' + W + tag) is not None for tag in ('br', 'drawing', 'pict', 'pageBreakBefore')):
+            continue
+        props = paragraph.find(W + 'pPr')
+        if props is None:
+            props = etree.Element(W + 'pPr'); paragraph.insert(0, props)
+        spacing = props.find(W + 'spacing')
+        if spacing is None: spacing = etree.SubElement(props, W + 'spacing')
+        for key, value in [('before', '0'), ('after', '0'), ('line', '20'), ('lineRule', 'exact')]:
+            spacing.set(W + key, value)
+        font = props.find(W + 'rPr')
+        if font is None: font = etree.SubElement(props, W + 'rPr')
+        size = font.find(W + 'sz')
+        if size is None: size = etree.SubElement(font, W + 'sz')
+        size.set(W + 'val', '2')
+    body = root.find(W + 'body')
+    section = body.find(W + 'sectPr')
+    position = body.index(section) if section is not None else len(body)
+    while position and body[position - 1].tag == W + 'p':
+        paragraph = body[position - 1]
+        if ''.join(paragraph.itertext()).strip() or paragraph.find('.//' + W + 'br') is not None:
+            break
+        body.remove(paragraph)
+        position -= 1
+    paragraph = etree.Element(W + 'p')
+    props = etree.SubElement(paragraph, W + 'pPr')
+    spacing = etree.SubElement(props, W + 'spacing')
+    for key, value in [('before', '0'), ('after', '0'), ('line', '20'), ('lineRule', 'exact')]:
+        spacing.set(W + key, value)
+    font = etree.SubElement(props, W + 'rPr')
+    etree.SubElement(font, W + 'sz').set(W + 'val', '2')
+    body.insert(position, paragraph)
 
 
 def write_package(root, template_bytes):
