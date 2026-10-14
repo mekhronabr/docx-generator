@@ -1,6 +1,5 @@
 """Fill the supplied Talabot form without rebuilding its layout or ZIP parts."""
 from copy import deepcopy
-from datetime import date
 from io import BytesIO
 from pathlib import Path
 import hashlib
@@ -10,6 +9,8 @@ from zipfile import ZipFile, ZIP_DEFLATED
 from lxml import etree
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.cell.rich_text import CellRichText, TextBlock
 
 TEMPLATE = Path(__file__).with_name('template_talabot.docx')
 W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
@@ -19,35 +20,77 @@ def lines(text):
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-def set_text(paragraph, text, font_size=None):
-    """Reuse existing run formatting, including formatting on empty paragraphs."""
-    nodes = list(paragraph.iter(W + 't'))
-    if nodes:
-        nodes[0].text = text
-        for node in nodes[1:]:
-            node.text = ''
-    else:
-        run = etree.SubElement(paragraph, W + 'r')
-        props = paragraph.find(W + 'pPr/' + W + 'rPr')
-        if props is not None:
-            run.append(deepcopy(props))
-        nodes = [etree.SubElement(run, W + 't')]
-        nodes[0].text = text
-    nodes[0].set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-    if font_size is not None:
-        run = nodes[0].getparent()
-        props = run.find(W + 'rPr')
-        if props is None:
-            props = etree.Element(W + 'rPr')
-            run.insert(0, props)
+def display_date(value):
+    text = str(value).strip()
+    return pd.to_datetime(text, dayfirst=not bool(re.match(r'^\d{4}-\d{2}-\d{2}', text)), errors='raise').strftime('%d.%m.%Y')
+
+
+def apply_style(run, style):
+    props = run.find(W + 'rPr')
+    if props is None:
+        props = etree.Element(W + 'rPr')
+        run.insert(0, props)
+    for key, tag in [('bold', 'b'), ('italic', 'i'), ('strike', 'strike')]:
+        if key in style:
+            node = props.find(W + tag)
+            if node is None:
+                node = etree.SubElement(props, W + tag)
+            node.set(W + 'val', '1' if style[key] else '0')
+    if 'underline' in style:
+        node = props.find(W + 'u')
+        if node is None:
+            node = etree.SubElement(props, W + 'u')
+        node.set(W + 'val', style['underline'] or 'none')
+    if style.get('color'):
+        node = props.find(W + 'color')
+        if node is None:
+            node = etree.SubElement(props, W + 'color')
+        node.set(W + 'val', style['color'])
+    if style.get('font'):
+        node = props.find(W + 'rFonts')
+        if node is None:
+            node = etree.SubElement(props, W + 'rFonts')
+        for attr in ('ascii', 'hAnsi', 'cs'):
+            node.set(W + attr, style['font'])
+    if style.get('vertical'):
+        etree.SubElement(props, W + 'vertAlign').set(W + 'val', style['vertical'])
+    if style.get('size'):
         for tag in ('sz', 'szCs'):
-            size = props.find(W + tag)
-            if size is None:
-                size = etree.SubElement(props, W + tag)
-            size.set(W + 'val', str(font_size * 2))
+            node = props.find(W + tag)
+            if node is None:
+                node = etree.SubElement(props, W + tag)
+            node.set(W + 'val', str(round(style['size'] * 2)))
 
 
-def generate(data, template_bytes=None):
+def fill_slot(control, text, fragments=None):
+    content = control.find(W + 'sdtContent')
+    base_run = content.find(W + 'r')
+    if base_run is None:
+        raise ValueError('Неподдерживаемое поле шаблона.')
+    parent = control.getparent()
+    position = parent.index(control)
+    # Rich fragments are valid only while the user has kept the original text.
+    if not fragments or ''.join(f['text'] for f in fragments) != text:
+        style = fragments[0].get('style', {}) if fragments else {}
+        fragments = [{'text': text, 'style': style}]
+    for fragment in fragments:
+        run = deepcopy(base_run)
+        for node in list(run):
+            if node.tag != W + 'rPr':
+                run.remove(node)
+        apply_style(run, fragment.get('style', {}))
+        for index, line in enumerate(fragment['text'].split('\n')):
+            if index:
+                etree.SubElement(run, W + 'br')
+            node = etree.SubElement(run, W + 't')
+            node.text = line
+            node.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        parent.insert(position, run)
+        position += 1
+    parent.remove(control)
+
+
+def render_root(data, template_bytes):
     students, absent = data['students'], data.get('absent', [])
     if not 1 <= len(students) <= 40:
         raise ValueError('В основном списке должно быть от 1 до 40 студентов.')
@@ -56,113 +99,32 @@ def generate(data, template_bytes=None):
     for field in ('form_code', 'group', 'date', 'curator', 'deputy'):
         if not data.get(field, '').strip():
             raise ValueError('Заполните код факультета, группу, дату и ФИО ответственных.')
-    values = students + absent + [data[k] for k in ('form_code', 'group', 'date', 'curator', 'deputy')]
-    if any(re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', value) for value in values):
+    slots = {key: data[key] for key in ('form_code', 'group', 'date', 'curator', 'deputy')}
+    slots.update({f'student_{i + 1}': students[i] if i < len(students) else '' for i in range(40)})
+    slots.update({f'absent_{i + 1}': absent[i] if i < len(absent) else '' for i in range(10)})
+    if any(re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', value) for value in slots.values()):
         raise ValueError('В тексте обнаружены недопустимые управляющие символы.')
-    output = BytesIO()
-    with ZipFile(BytesIO(template_bytes or TEMPLATE.read_bytes())) as source:
+    with ZipFile(BytesIO(template_bytes)) as source:
         root = etree.fromstring(source.read('word/document.xml'))
-        paragraphs = list(root.iter(W + 'p'))
-        set_text(paragraphs[0], data['form_code'])
-        tables = list(root.iter(W + 'tbl'))
-        align_main_table(tables[2])
-        match_numbering(tables[2], tables[3])
-        for table in (tables[2], tables[3]):
-            equalize_student_rows(table)
-        for table, offset in ((tables[2], 0), (tables[3], 20), (tables[5], 0), (tables[6], 5)):
-            names = students if len(table.findall(W + 'tr')) == 21 else absent
-            for index, row in enumerate(table.findall(W + 'tr')[1:], offset):
-                cell = row.findall(W + 'tc')[1]
-                set_text(cell.find(W + 'p'), names[index] if index < len(names) else '', font_size=10)
-        for paragraph in paragraphs:
-            text = ''.join(n.text or '' for n in paragraph.iter(W + 't'))
-            if 'Ба ҳайъати асосии' in text:
-                replace_text(paragraph, '_______________', data['group'])
-                replace_text(paragraph, '_______', data['date'])
-        for row, name in zip(tables[7].findall(W + 'tr'), (data['curator'], data['deputy'])):
-            set_text(row.findall(W + 'tc')[2].find(W + 'p'), name, font_size=10)
-        with ZipFile(output, 'w', ZIP_DEFLATED) as target:
-            for item in source.infolist():
-                contents = etree.tostring(root, encoding='UTF-8', xml_declaration=True, standalone=True) if item.filename == 'word/document.xml' else source.read(item.filename)
-                target.writestr(item, contents)
+    formats = data.get('formats', {})
+    for control in list(root.iter(W + 'sdt')):
+        tag = control.find(W + 'sdtPr/' + W + 'tag').get(W + 'val')
+        fill_slot(control, slots[tag], formats.get(tag))
+    return root
+
+
+def write_package(root, template_bytes):
+    output = BytesIO()
+    with ZipFile(BytesIO(template_bytes)) as source, ZipFile(output, 'w', ZIP_DEFLATED) as target:
+        for item in source.infolist():
+            contents = etree.tostring(root, encoding='UTF-8', xml_declaration=True, standalone=True) if item.filename == 'word/document.xml' else source.read(item.filename)
+            target.writestr(item, contents)
     return output.getvalue()
 
 
-def match_numbering(left, right):
-    """Use the right table's explicit number formatting for numbers 1–20."""
-    reference = right.findall(W + 'tr')[1].findall(W + 'tc')[0].find(W + 'p')
-    for number, row in enumerate(left.findall(W + 'tr')[1:], 1):
-        cell = row.findall(W + 'tc')[0]
-        original = cell.find(W + 'p')
-        paragraph = deepcopy(reference)
-        # The left number column is narrower; the right column's indent would wrap.
-        indent = paragraph.find(W + 'pPr/' + W + 'ind')
-        if indent is not None:
-            indent.set(W + 'left', '0')
-        for attribute in list(paragraph.attrib):
-            if etree.QName(attribute).localname in ('paraId', 'textId'):
-                del paragraph.attrib[attribute]
-        set_text(paragraph, f'{number}.')
-        cell.replace(original, paragraph)
-
-
-def equalize_student_rows(table):
-    """Keep empty and filled student rows equally tall, with room for two lines."""
-    for row in table.findall(W + 'tr')[1:]:
-        props = row.find(W + 'trPr')
-        if props is None:
-            props = etree.Element(W + 'trPr')
-            row.insert(0, props)
-        height = props.find(W + 'trHeight')
-        if height is None:
-            height = etree.SubElement(props, W + 'trHeight')
-        height.set(W + 'val', '560')
-        height.set(W + 'hRule', 'atLeast')
-
-
-def align_main_table(table):
-    """Use one grid for the header and body; the source header skips a grid slot."""
-    widths = (704, 2961, 1505)
-    grid = table.find(W + 'tblGrid')
-    for child in list(grid):
-        grid.remove(child)
-    for width in widths:
-        etree.SubElement(grid, W + 'gridCol').set(W + 'w', str(width))
-    props = table.find(W + 'tblPr')
-    props.find(W + 'tblW').set(W + 'w', str(sum(widths)))
-    layout = props.find(W + 'tblLayout')
-    if layout is None:
-        layout = etree.SubElement(props, W + 'tblLayout')
-    layout.set(W + 'type', 'fixed')
-    for row in table.findall(W + 'tr'):
-        row_props = row.find(W + 'trPr')
-        if row_props is not None:
-            for tag in ('gridBefore', 'gridAfter', 'wBefore', 'wAfter'):
-                node = row_props.find(W + tag)
-                if node is not None:
-                    row_props.remove(node)
-        for cell, width in zip(row.findall(W + 'tc'), widths):
-            cell_props = cell.find(W + 'tcPr')
-            span = cell_props.find(W + 'gridSpan')
-            if span is not None:
-                cell_props.remove(span)
-            cell_props.find(W + 'tcW').set(W + 'w', str(width))
-
-
-def replace_text(paragraph, old, new):
-    """Replace a slot even when Word has split it across multiple text runs."""
-    nodes = list(paragraph.iter(W + 't'))
-    text = ''.join(n.text or '' for n in nodes)
-    start = text.index(old)
-    end = start + len(old)
-    offset = 0
-    for node in nodes:
-        value = node.text or ''
-        stop = offset + len(value)
-        if offset < end and stop > start:
-            node.text = value[:max(0, start - offset)] + (new if offset <= start < stop else '') + value[max(0, end - offset):]
-            node.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-        offset = stop
+def generate(data, template_bytes=None):
+    template_bytes = template_bytes or TEMPLATE.read_bytes()
+    return write_package(render_root(data, template_bytes), template_bytes)
 
 
 def main():
@@ -170,15 +132,25 @@ def main():
     if not TEMPLATE.exists():
         st.error('Отсутствует template_talabot.docx рядом с app.py.')
         return
+    version = hashlib.sha256(TEMPLATE.read_bytes() + Path(__file__).read_bytes()).hexdigest()
+    if st.session_state.get('talabot_version') != version:
+        st.session_state.pop('talabot_result', None)
+        st.session_state.pop('talabot_batch_result', None)
+        st.session_state.talabot_version = version
     excel_example = BytesIO()
     pd.DataFrame(columns=['Ному насаби донишҷӯ', 'Гурӯҳ', 'Код факультета', 'Дата', 'ФИО Куратора', 'ФИО Заместителя', 'Отсутствует']).to_excel(excel_example, index=False)
     st.download_button('Скачать пустую таблицу Excel для Талабот', excel_example.getvalue(), file_name='Талабот_ҷадвали_холӣ.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', on_click='ignore')
     mode = st.radio('Режим генерации', ['Одна группа', 'Несколько групп'], horizontal=True)
+    from examples_ui import show_examples
+    show_examples('talabot_batch' if mode == 'Несколько групп' else 'talabot', TEMPLATE)
     if mode == 'Несколько групп':
         batch_main()
         return
     upload = st.file_uploader('Excel со списком студентов (.xlsx)', type=['xlsx'], key='talabot_excel')
     imported = ''
+    imported_formats = {}
+    metadata_formats = {}
+    defaults = dict(form_code='ФЭ_11.', group='1_53.01.05тб', curator='', deputy='', date='10.10.2025', absent='')
     if upload is not None:
         try:
             if upload.size > 20 * 1024 * 1024:
@@ -191,6 +163,7 @@ def main():
                 raise ValueError('Допустимо до 100 000 строк. Разделите Excel.')
             if not len(df.columns):
                 raise ValueError('В Excel нет колонок.')
+            df.attrs['formats'] = excel_formats(upload.getvalue(), df)
             columns = list(df.columns)
             preferred = next((i for i, c in enumerate(columns) if str(c).strip().casefold() in ('фио студента', 'ному насаби донишҷӯ', 'фио', 'ному насаб')), 0)
             column = st.selectbox('Колонка с ФИО студентов', columns, index=preferred, key='talabot_name_column')
@@ -200,22 +173,44 @@ def main():
                 selected = st.selectbox('Группа из Excel', list(dict.fromkeys(df[group_column])), key='talabot_excel_group')
                 df = df.loc[df[group_column] == selected]
             imported = '\n'.join(str(v).strip() for v in df[column] if str(v).strip())
+            imported_formats = {str(df.at[i, column]).strip(): df.attrs['formats'].get((i, column), []) for i in df.index if str(df.at[i, column]).strip()}
+            for tag, candidates in [('form_code', ['Код факультета']), ('group', ['Группа', 'Гурӯҳ']), ('date', ['Дата']), ('curator', ['ФИО Куратора', 'Куратори гурӯҳ']), ('deputy', ['ФИО Заместителя', 'ФИО Зам. декана', 'Муовини декан оид ба тарбия'])]:
+                field = next((c for c in candidates if c in df), None)
+                if field is not None:
+                    indices = [i for i in df.index if str(df.at[i, field]).strip()]
+                    if indices:
+                        defaults[tag] = str(df.at[indices[0], field]).strip()
+                        metadata_formats[tag] = df.attrs['formats'].get((indices[0], field), [])
+            defaults['date'] = display_date(defaults['date'])
+            if 'Отсутствует' in df:
+                defaults['absent'] = '\n'.join(str(df.at[i, column]).strip() for i in df.index if str(df.at[i, 'Отсутствует']).strip().casefold() in {'да', '1', 'yes', 'true', '+'})
         except Exception as error:
             st.error(f'Не удалось прочитать Excel: {error}')
             return
     with st.form('talabot_form'):
-        code = st.text_input('Код факультета', value='ФЭ_11')
-        group = st.text_input('Группа', value='1_53.01.05тб')
-        when = st.date_input('Дата ознакомления', value=date(2025, 10, 10))
-        curator = st.text_input('Фамилия и имя — куратори гурӯҳи академӣ')
-        deputy = st.text_input('Фамилия и имя — муовини директор оид ба тарбия')
+        code = st.text_input('Код факультета', value=defaults['form_code'])
+        group = st.text_input('Группа', value=defaults['group'])
+        when = st.date_input('Дата ознакомления', value=pd.to_datetime(defaults['date'], format='%d.%m.%Y').date())
+        curator = st.text_input('Фамилия и имя — куратори гурӯҳи академӣ', value=defaults['curator'])
+        deputy = st.text_input('Фамилия и имя — муовини директор оид ба тарбия', value=defaults['deputy'])
         students = st.text_area('Фамилии и имена студентов (до 40)', value=imported, height=300)
-        absent = st.text_area('Отсутствующие (до 10, по одному на строку)', height=120)
+        absent = st.text_area('Отсутствующие (до 10, по одному на строку)', value=defaults['absent'], height=120)
+        with st.expander('Оформление полей при ручном вводе'):
+            st.caption('Из Excel сохраняются жирность, курсив, подчёркивание и регистр. Эти настройки применяются к тексту, введённому вручную.')
+            manual_styles = {}
+            for tag, label, defaults in [('form_code', 'Код факультета', (True, False, False)), ('group', 'Группа', (True, True, True)), ('date', 'Дата', (False, True, True)), ('students', 'ФИО студентов', (False, False, False)), ('absent', 'Отсутствующие', (False, False, False)), ('curator', 'Куратор', (True, True, True)), ('deputy', 'Заместитель', (True, True, True))]:
+                st.write(label)
+                controls = st.columns(3)
+                manual_styles[tag] = dict(bold=controls[0].checkbox('Жирный', value=defaults[0], key=f'talabot_{tag}_bold'), italic=controls[1].checkbox('Курсив', value=defaults[1], key=f'talabot_{tag}_italic'), underline='single' if controls[2].checkbox('Подчёркнутый', value=defaults[2], key=f'talabot_{tag}_underline') else 'none')
         submitted = st.form_submit_button('Сгенерировать документ', type='primary')
     if submitted:
         st.session_state.pop('talabot_result', None)
         try:
             data = dict(form_code=code.strip(), group=group.strip(), date=when.strftime('%d.%m.%Y'), curator=curator.strip(), deputy=deputy.strip(), students=lines(students), absent=lines(absent))
+            data['formats'] = {tag: metadata_formats.get(tag) or [{'text': data[tag], 'style': manual_styles[tag]}] for tag in ('form_code', 'group', 'date', 'curator', 'deputy')}
+            for field, prefix in [('students', 'student'), ('absent', 'absent')]:
+                for i, name in enumerate(data[field], 1):
+                    data['formats'][f'{prefix}_{i}'] = imported_formats.get(name) or [{'text': name, 'style': manual_styles[field]}]
             st.session_state.talabot_result = generate(data)
         except Exception as error:
             st.error(f'Не удалось создать документ: {error}')
@@ -224,6 +219,54 @@ def main():
 
 
 BATCH_FIELDS = ['Группа', 'Код факультета', 'Дата', 'ФИО Куратора', 'ФИО Заместителя']
+
+
+def excel_formats(contents, df):
+    """Read font emphasis and rich-text fragments that pandas intentionally drops."""
+    workbook = load_workbook(BytesIO(contents), data_only=True, rich_text=True)
+    sheet = workbook.worksheets[0]
+    default_font = workbook._fonts[0]
+    formats = {}
+
+    def font_style(font, baseline):
+        result = {}
+        for attr, key in [('b', 'bold'), ('i', 'italic'), ('strike', 'strike')]:
+            if getattr(font, attr, None) != getattr(baseline, attr, None):
+                result[key] = bool(getattr(font, attr, None))
+        underline = getattr(font, 'u', None)
+        if underline != getattr(baseline, 'u', None):
+            result['underline'] = {'singleAccounting': 'single', 'doubleAccounting': 'double'}.get(underline, underline) or 'none'
+        color = getattr(font, 'color', None)
+        if color is not None and color.type == 'rgb':
+            result['color'] = color.rgb[-6:]
+        font_name = next((value for value in (getattr(font, 'name', None), getattr(font, 'rFont', None)) if isinstance(value, str)), None)
+        baseline_name = next((value for value in (getattr(baseline, 'name', None), getattr(baseline, 'rFont', None)) if isinstance(value, str)), None)
+        if font_name and font_name != baseline_name:
+            result['font'] = font_name
+        if getattr(font, 'vertAlign', None):
+            result['vertical'] = font.vertAlign
+        size = getattr(font, 'sz', None)
+        if isinstance(size, (int, float)) and size != getattr(baseline, 'sz', None):
+            result['size'] = size
+        return result
+
+    for index in df.index:
+        for col_index, column in enumerate(df.columns, 1):
+            cell = sheet.cell(int(index) + 2, col_index)
+            base_style = font_style(cell.font, default_font)
+            if isinstance(cell.value, CellRichText):
+                fragments = []
+                for part in cell.value:
+                    if isinstance(part, TextBlock):
+                        style = {**base_style, **font_style(part.font, cell.font)}
+                        fragments.append({'text': part.text, 'style': style})
+                    else:
+                        fragments.append({'text': str(part), 'style': base_style})
+            else:
+                fragments = [{'text': str(df.at[index, column]), 'style': base_style}]
+            formats[(index, column)] = fragments
+    workbook.close()
+    return formats
 
 
 def read_batch_excel(contents):
@@ -261,6 +304,7 @@ def read_batch_excel(contents):
         allowed = {'', 'да', 'нет', '1', '0', 'yes', 'no', 'true', 'false', '+', '-'}
         if not df['Отсутствует'].str.casefold().isin(allowed).all():
             raise ValueError('В колонке «Отсутствует» укажите «да», «нет» или оставьте пусто.')
+    df.attrs['formats'] = excel_formats(contents, df)
     return df
 
 
@@ -274,38 +318,65 @@ def batch_settings(df):
                 raise ValueError(f'Группа {group}: разные значения в колонке «{field}». Укажите одно значение для группы.')
             value = values[0] if values else ''
             if field == 'Дата' and value:
-                value = pd.to_datetime(value, dayfirst=True, errors='raise').strftime('%d.%m.%Y')
+                value = display_date(value)
             item[field] = value
         settings.append(item)
     return pd.DataFrame(settings, columns=BATCH_FIELDS)
 
 
 def generate_batch(df, settings, progress=lambda done, total: None):
-    """One separate DOCX per group, numbered ZIP entries avoid name collisions."""
+    """One shared Word document; every group starts on a fresh page."""
     if len(settings) != len(df['Группа'].unique()) or settings['Группа'].duplicated().any() or set(settings['Группа']) != set(df['Группа']):
         raise ValueError('Настройки должны содержать каждую группу ровно один раз.')
-    archive = BytesIO()
     template_bytes = TEMPLATE.read_bytes()
-    with ZipFile(archive, 'w', ZIP_DEFLATED) as output:
-        for index, item in enumerate(settings.to_dict('records'), 1):
-            group = item['Группа']
-            rows = df.loc[df['Группа'] == group]
-            missing = [field for field in BATCH_FIELDS if pd.isna(item[field]) or not str(item[field]).strip()]
-            if missing:
-                raise ValueError(f'Группа {group}: заполните ' + ', '.join(missing))
-            when = pd.to_datetime(str(item['Дата']), dayfirst=True, errors='raise').strftime('%d.%m.%Y')
-            absent = rows.loc[rows['Отсутствует'].str.casefold().isin({'да', '1', 'yes', 'true', '+'}), 'ФИО Студента'].tolist() if 'Отсутствует' in rows else []
-            data = dict(form_code=str(item['Код факультета']).strip(), group=group, date=when, curator=str(item['ФИО Куратора']).strip(), deputy=str(item['ФИО Заместителя']).strip(), students=rows['ФИО Студента'].tolist(), absent=absent)
-            try:
-                document = generate(data, template_bytes)
-            except ValueError as error:
-                raise ValueError(f'Группа {group}: {error}') from error
-            name = re.sub(r'[^\w.-]', '_', group)[:80]
-            output.writestr(f'Талабот_{index:03d}_{name}.docx', document)
-            if archive.tell() > 64 * 1024 * 1024:
-                raise ValueError('Архив превышает 64 МБ. Разделите Excel на несколько файлов.')
-            progress(index, len(settings))
-    return archive.getvalue()
+    with ZipFile(BytesIO(template_bytes)) as source:
+        combined = etree.fromstring(source.read('word/document.xml'))
+    body = combined.find(W + 'body')
+    section = deepcopy(body.find(W + 'sectPr'))
+    for child in list(body):
+        body.remove(child)
+    formats = df.attrs.get('formats', {})
+    total_size = 0
+    for index, item in enumerate(settings.to_dict('records'), 1):
+        group = item['Группа']
+        rows = df.loc[df['Группа'] == group]
+        missing = [field for field in BATCH_FIELDS if pd.isna(item[field]) or not str(item[field]).strip()]
+        if missing:
+            raise ValueError(f'Группа {group}: заполните ' + ', '.join(missing))
+        when = display_date(item['Дата'])
+        absent = rows.loc[rows['Отсутствует'].str.casefold().isin({'да', '1', 'yes', 'true', '+'}), 'ФИО Студента'].tolist() if 'Отсутствует' in rows else []
+        data = dict(form_code=str(item['Код факультета']).strip(), group=group, date=when, curator=str(item['ФИО Куратора']).strip(), deputy=str(item['ФИО Заместителя']).strip(), students=rows['ФИО Студента'].tolist(), absent=absent)
+        data['formats'] = {}
+        for field, slot in [('Код факультета', 'form_code'), ('Группа', 'group'), ('Дата', 'date'), ('ФИО Куратора', 'curator'), ('ФИО Заместителя', 'deputy')]:
+            source_index = next((i for i in rows.index if field in rows and rows.at[i, field]), rows.index[0])
+            data['formats'][slot] = formats.get((source_index, field), [])
+        for position, source_index in enumerate(rows.index, 1):
+            data['formats'][f'student_{position}'] = formats.get((source_index, 'ФИО Студента'), [])
+        if 'Отсутствует' in rows:
+            absent_indices = rows.index[rows['Отсутствует'].str.casefold().isin({'да', '1', 'yes', 'true', '+'})]
+            for position, source_index in enumerate(absent_indices, 1):
+                data['formats'][f'absent_{position}'] = formats.get((source_index, 'ФИО Студента'), [])
+        try:
+            page_root = render_root(data, template_bytes)
+        except ValueError as error:
+            raise ValueError(f'Группа {group}: {error}') from error
+        if index > 1:
+            paragraph = etree.SubElement(body, W + 'p')
+            props = etree.SubElement(paragraph, W + 'pPr')
+            spacing = etree.SubElement(props, W + 'spacing')
+            spacing.set(W + 'before', '0')
+            spacing.set(W + 'after', '0')
+            etree.SubElement(etree.SubElement(paragraph, W + 'r'), W + 'br').set(W + 'type', 'page')
+        page_body = page_root.find(W + 'body')
+        for child in list(page_body):
+            if child.tag != W + 'sectPr':
+                body.append(child)
+        total_size += len(etree.tostring(page_root))
+        if total_size > 64 * 1024 * 1024:
+            raise ValueError('Документ слишком большой. Разделите Excel на несколько файлов.')
+        progress(index, len(settings))
+    body.append(section)
+    return write_package(combined, template_bytes)
 
 
 def batch_main():
@@ -326,11 +397,11 @@ def batch_main():
         return
     df = df.loc[df['Группа'].isin(selected)]
     settings = settings.loc[settings['Группа'].isin(selected)]
-    st.info(f'Студентов: {len(df)}. Документов: {len(settings)}.')
+    st.info(f'Студентов: {len(df)}. Групп: {len(settings)}. Результат — один Word.')
     with st.form('talabot_batch_form'):
         st.write('Настройки каждого документа')
         edited = st.data_editor(settings, hide_index=True, disabled=['Группа'], num_rows='fixed', key='talabot_batch_settings')
-        submitted = st.form_submit_button('Сгенерировать все документы', type='primary')
+        submitted = st.form_submit_button('Сгенерировать общий документ', type='primary')
     identity = hashlib.sha256(upload.getvalue() + edited.to_csv(index=False).encode()).hexdigest()
     if st.session_state.get('talabot_batch_identity') != identity:
         st.session_state.pop('talabot_batch_result', None)
@@ -340,8 +411,8 @@ def batch_main():
         try:
             st.session_state.talabot_batch_result = generate_batch(df, edited, lambda done, total: bar.progress(done / total))
             st.session_state.talabot_batch_identity = identity
-            st.success(f'Готово документов: {len(edited)}.')
+            st.success(f'Готов один Word для {len(edited)} групп.')
         except Exception as error:
             st.error(f'Не удалось создать документы: {error}')
     if st.session_state.get('talabot_batch_result'):
-        st.download_button('Скачать все документы ZIP', st.session_state.talabot_batch_result, file_name='Талабот_все_группы.zip', mime='application/zip', on_click='ignore')
+        st.download_button('Скачать общий Word', st.session_state.talabot_batch_result, file_name='Талабот_все_группы.docx', mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document', on_click='ignore')

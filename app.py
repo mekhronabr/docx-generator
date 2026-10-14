@@ -249,6 +249,8 @@ def main():
         from talabot import main as talabot_main
         talabot_main()
         return
+    from examples_ui import show_examples
+    show_examples('ogohinoma', TEMPLATE)
     st.write('1. Скачайте пустую таблицу с колонками на таджикском языке.')
     excel_template = BASE / 'example.xlsx'
     if excel_template.exists():
