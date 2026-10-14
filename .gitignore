@@ -6,4 +6,5 @@ __pycache__/
 output/
 *.xlsx
 !example.xlsx
+!examples/*.xlsx
 *.zip
