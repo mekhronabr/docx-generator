@@ -246,8 +246,11 @@ def main():
     st.title('Макрос')
     template_kind = st.selectbox('Шаблон документа', ['Огоҳинома', 'Талабот'])
     if template_kind == 'Талабот':
-        from talabot import main as talabot_main
-        talabot_main()
+        # Streamlit reruns this entrypoint on deploy, but imported modules may
+        # stay in sys.modules. Reload the stateless renderer with its template.
+        import importlib
+        import talabot
+        importlib.reload(talabot).main()
         return
     from examples_ui import show_examples
     show_examples('ogohinoma', TEMPLATE)
