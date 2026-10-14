@@ -31,7 +31,7 @@ class BatchTests(unittest.TestCase):
             root = etree.fromstring(document.read('word/document.xml'))
             pages = [[]]
             for child in root.find(W + 'body'):
-                if child.find('.//' + W + 'br[@' + W + 'type="page"]') is not None:
+                if child.find('.//' + W + 'pageBreakBefore') is not None:
                     pages.append([])
                 else:
                     pages[-1].append(''.join(child.itertext()))

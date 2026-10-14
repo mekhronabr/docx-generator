@@ -92,21 +92,25 @@ def fill_slot(control, text, fragments=None):
 
 def render_root(data, template_bytes):
     students, absent = data['students'], data.get('absent', [])
+    with ZipFile(BytesIO(template_bytes)) as source:
+        root = etree.fromstring(source.read('word/document.xml'))
+    absence_tags = [control.find(W + 'sdtPr/' + W + 'tag').get(W + 'val') for control in root.iter(W + 'sdt') if control.find(W + 'sdtPr/' + W + 'tag').get(W + 'val').startswith('absent_')]
     if not 1 <= len(students) <= 40:
         raise ValueError('В основном списке должно быть от 1 до 40 студентов.')
-    if len(absent) > 10:
-        raise ValueError('В списке отсутствующих допустимо до 10 студентов.')
+    if len(absent) > len(absence_tags):
+        raise ValueError(f'В списке отсутствующих допустимо до {len(absence_tags)} студентов — по числу мест в шаблоне.')
     for field in ('form_code', 'group', 'date', 'curator', 'deputy'):
         if not data.get(field, '').strip():
             raise ValueError('Заполните код факультета, группу, дату и ФИО ответственных.')
     slots = {key: data[key] for key in ('form_code', 'group', 'date', 'curator', 'deputy')}
     slots.update({f'student_{i + 1}': students[i] if i < len(students) else '' for i in range(40)})
-    slots.update({f'absent_{i + 1}': absent[i] if i < len(absent) else '' for i in range(10)})
+    slots.update({tag: absent[i] if i < len(absent) else '' for i, tag in enumerate(absence_tags)})
     if any(re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', value) for value in slots.values()):
         raise ValueError('В тексте обнаружены недопустимые управляющие символы.')
-    with ZipFile(BytesIO(template_bytes)) as source:
-        root = etree.fromstring(source.read('word/document.xml'))
     formats = data.get('formats', {})
+    formats = dict(formats)
+    for i, tag in reversed(list(enumerate(absence_tags))):
+        formats[tag] = data.get('formats', {}).get(f'absent_{i + 1}', [])
     for control in list(root.iter(W + 'sdt')):
         tag = control.find(W + 'sdtPr/' + W + 'tag').get(W + 'val')
         fill_slot(control, slots[tag], formats.get(tag))
@@ -254,6 +258,8 @@ def excel_formats(contents, df):
         for col_index, column in enumerate(df.columns, 1):
             cell = sheet.cell(int(index) + 2, col_index)
             base_style = font_style(cell.font, default_font)
+            if str(column).casefold() in ('фио студента', 'ному насаби донишҷӯ', 'фио', 'ному насаб'):
+                base_style.update(bold=bool(cell.font.b), italic=bool(cell.font.i), underline=cell.font.u or 'none')
             if isinstance(cell.value, CellRichText):
                 fragments = []
                 for part in cell.value:
@@ -366,7 +372,9 @@ def generate_batch(df, settings, progress=lambda done, total: None):
             spacing = etree.SubElement(props, W + 'spacing')
             spacing.set(W + 'before', '0')
             spacing.set(W + 'after', '0')
-            etree.SubElement(etree.SubElement(paragraph, W + 'r'), W + 'br').set(W + 'type', 'page')
+            spacing.set(W + 'line', '20')
+            spacing.set(W + 'lineRule', 'exact')
+            etree.SubElement(props, W + 'pageBreakBefore')
         page_body = page_root.find(W + 'body')
         for child in list(page_body):
             if child.tag != W + 'sectPr':

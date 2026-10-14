@@ -1,165 +1,103 @@
-"""Rebuild the one-page Talabot form to match the supplied photograph.
-
-Run with the bundled document Python runtime. The document uses in-flow
-nested tables, so Word and PDF do not depend on floating-table positioning.
+"""Adapt the supplied Word reference in place, preserving its package and layout.
+Run with bundled document Python: python qa/build_talabot_template.py reference.docx
 """
+from copy import deepcopy
 from pathlib import Path
-from docx import Document
-from docx.shared import Mm, Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_ROW_HEIGHT_RULE
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
-
+import sys
+from zipfile import ZipFile
+from lxml import etree
+W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 BASE = Path(__file__).resolve().parents[1]
-INTRO = ('Куратори гуруҳ бо талаботи мазкур, ки дар саҳифаи аввал оварда шуда аст, '
-         'моро шинос намуда моҳият ва мақсади онро шарҳ доданд. Мо донишҷӯёни гурӯҳ '
-         'ба моҳияти талаботи мазкур сарфаҳм рафтем ва ӯҳдадор мешавем, ки онро риоя намоем.')
 
 
-def paragraph(p, size=10, bold=False, italic=False, align=WD_ALIGN_PARAGRAPH.LEFT):
-    p.alignment = align
-    f = p.paragraph_format
-    f.space_before = Pt(0)
-    f.space_after = Pt(0)
-    f.line_spacing = 1
-    f.keep_with_next = False
-    f.widow_control = False
-    for run in p.runs:
-        run.font.name = 'Times New Roman'
-        run.font.size = Pt(size)
-        run.bold, run.italic = bold, italic
-    return p
+def wrap_run(parent, run, tag):
+    control = etree.Element(W + 'sdt')
+    props = etree.SubElement(control, W + 'sdtPr')
+    etree.SubElement(props, W + 'tag').set(W + 'val', tag)
+    content = etree.SubElement(control, W + 'sdtContent')
+    parent.replace(run, control)
+    content.append(run)
 
 
-def slot(p, tag, visible='', size=10, bold=False, italic=False, underline=False):
-    run = p.add_run(visible)
-    run.font.name, run.font.size = 'Times New Roman', Pt(size)
-    run.bold, run.italic, run.underline = bold, italic, underline
-    sdt = OxmlElement('w:sdt')
-    props = OxmlElement('w:sdtPr')
-    field = OxmlElement('w:tag')
-    field.set(qn('w:val'), tag)
-    props.append(field)
-    sdt.append(props)
-    content = OxmlElement('w:sdtContent')
-    p._p.replace(run._r, sdt)
-    content.append(run._r)
-    sdt.append(content)
+def wrap_paragraph(paragraph, tag, clear=False):
+    runs = paragraph.findall(W + 'r')
+    run = deepcopy(runs[0]) if runs else etree.Element(W + 'r')
+    for child in list(run):
+        if child.tag != W + 'rPr': run.remove(child)
+    node = etree.SubElement(run, W + 't')
+    node.text = '' if clear else ''.join(paragraph.itertext())
+    for child in list(paragraph):
+        if child.tag != W + 'pPr': paragraph.remove(child)
+    paragraph.append(run)
+    wrap_run(paragraph, run, tag)
 
 
-def table_style(table, widths, bordered=False):
-    table.autofit = False
-    for col, width in zip(table.columns, widths):
-        col.width = Mm(width)
-    props = table._tbl.tblPr
-    borders = OxmlElement('w:tblBorders')
-    for tag in ('top', 'left', 'bottom', 'right', 'insideH', 'insideV'):
-        edge = OxmlElement('w:' + tag)
-        edge.set(qn('w:val'), 'single' if bordered else 'nil')
-        edge.set(qn('w:sz'), '4')
-        edge.set(qn('w:color'), '777777')
-        borders.append(edge)
-    props.append(borders)
-    margins = OxmlElement('w:tblCellMar')
-    for tag, value in [('top', 0), ('bottom', 0), ('left', 45 if bordered else 0), ('right', 45 if bordered else 0)]:
-        edge = OxmlElement('w:' + tag)
-        edge.set(qn('w:w'), str(value))
-        edge.set(qn('w:type'), 'dxa')
-        margins.append(edge)
-    props.append(margins)
-    for row in table.rows:
-        cant = OxmlElement('w:cantSplit')
-        row._tr.get_or_add_trPr().append(cant)
-        for cell, width in zip(row.cells, widths):
-            cell.width = Mm(width)
-            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-            paragraph(cell.paragraphs[0])
-
-
-def spacer(doc, size=3):
-    p = doc.add_paragraph()
-    paragraph(p, size=1)
-    p.paragraph_format.line_spacing = Pt(size)
-    p.paragraph_format.space_after = Pt(0)
-
-
-def paired(doc, absent=False):
-    outer = doc.add_table(rows=1, cols=3)
-    table_style(outer, (92.5, 5, 92.5))
-    for side, outer_cell in enumerate((outer.cell(0, 0), outer.cell(0, 2))):
-        # Remove the initial empty paragraph; leave only the required tiny tail.
-        initial = outer_cell.paragraphs[0]._p
-        outer_cell._tc.remove(initial)
-        count = 5 if absent else 20
-        widths = (9, 83.5) if absent else (9, 60, 23.5)
-        table = outer_cell.add_table(rows=count + 1, cols=len(widths))
-        table_style(table, widths, True)
-        headers = ('№', 'Ному насаб') if absent else ('№', 'Ному насаб', 'Имзо')
-        for cell, label in zip(table.rows[0].cells, headers):
-            cell.text = label
-            paragraph(cell.paragraphs[0], 11, True, align=WD_ALIGN_PARAGRAPH.CENTER)
-        table.rows[0].height, table.rows[0].height_rule = Pt(14), WD_ROW_HEIGHT_RULE.AT_LEAST
-        for index, row in enumerate(table.rows[1:], 1):
-            number = side * count + index
-            row.height, row.height_rule = Pt(25 if not absent else 14), WD_ROW_HEIGHT_RULE.AT_LEAST
-            row.cells[0].text = f'{number}.'
-            paragraph(row.cells[0].paragraphs[0], 10)
-            p = paragraph(row.cells[1].paragraphs[0], 10)
-            slot(p, f'{"absent" if absent else "student"}_{number}')
-        for p in outer_cell.paragraphs:
-            paragraph(p, 1)
-            p.paragraph_format.line_spacing = Pt(1)
-
-
-def build():
-    doc = Document()
-    s = doc.sections[0]
-    s.page_width, s.page_height = Mm(210), Mm(297)
-    s.top_margin = s.bottom_margin = s.left_margin = s.right_margin = Mm(10)
-    normal = doc.styles['Normal']
-    normal.font.name, normal.font.size = 'Times New Roman', Pt(10)
-    normal.paragraph_format.space_after = Pt(0)
-    normal.paragraph_format.line_spacing = 1
-    top = doc.add_table(rows=1, cols=2)
-    table_style(top, (25, 165))
-    p = paragraph(top.cell(0, 0).paragraphs[0], align=WD_ALIGN_PARAGRAPH.CENTER)
-    slot(p, 'form_code', 'ФЭ_11.', size=12, bold=True)
-    top.cell(0, 1).text = INTRO
-    paragraph(top.cell(0, 1).paragraphs[0], 12, True, True, WD_ALIGN_PARAGRAPH.JUSTIFY)
-    spacer(doc, 4)
-    paired(doc)
-    spacer(doc, 6)
-    p = paragraph(doc.add_paragraph(), 11, italic=True)
-    p.add_run('Ба ҳайъати асосии гурӯҳи академии  ')
-    slot(p, 'group', '_______________', size=11, bold=True, italic=True, underline=True)
-    p.add_run('  моҳияти талаботи мазкур санаи ')
-    slot(p, 'date', '__________', size=11, italic=True, underline=True)
-    p.add_run(' дар доираи дарси кураторӣ фаҳмонида шуд. Дар дарс донишҷӯёни зерин иштирок надоштанд.')
-    for run in p.runs:
-        run.font.name, run.font.size, run.italic = 'Times New Roman', Pt(11), True
-    spacer(doc, 4)
-    paired(doc, absent=True)
-    spacer(doc, 8)
-    signatures = doc.add_table(rows=2, cols=3)
-    table_style(signatures, (70, 40, 80))
-    for row, label, tag in zip(signatures.rows, ('Куратори гурӯҳи академӣ:', 'Муовини декан оид ба тарбия:'), ('curator', 'deputy')):
-        row.height, row.height_rule = Pt(27), WD_ROW_HEIGHT_RULE.AT_LEAST
-        row.cells[0].text = label
-        paragraph(row.cells[0].paragraphs[0], 11, True, True)
-        row.cells[1].text = '___________________'
-        paragraph(row.cells[1].paragraphs[0], 11, align=WD_ALIGN_PARAGRAPH.CENTER)
-        p = paragraph(row.cells[2].paragraphs[0], 11, align=WD_ALIGN_PARAGRAPH.CENTER)
-        slot(p, tag, '_____________________________', size=11, bold=True, italic=True, underline=True)
-        border = OxmlElement('w:pBdr')
-        bottom = OxmlElement('w:bottom')
-        bottom.set(qn('w:val'), 'single')
-        bottom.set(qn('w:sz'), '4')
-        bottom.set(qn('w:color'), '777777')
-        border.append(bottom)
-        p._p.get_or_add_pPr().append(border)
-    doc.save(BASE / 'template_talabot.docx')
-
+def build(reference):
+    with ZipFile(reference) as source:
+        root = etree.fromstring(source.read('word/document.xml'))
+        tables = list(root.iter(W + 'tbl'))
+        wrap_paragraph(tables[0].find(W + 'tr').find(W + 'tc').find(W + 'p'), 'form_code')
+        for table_index, prefix, offset in [(1, 'student', 0), (2, 'student', 20), (4, 'absent', 0), (5, 'absent', 5)]:
+            table = tables[table_index]
+            header = table.findall(W + 'tr')[0].findall(W + 'tc')[1].find(W + 'p')
+            nodes = list(header.iter(W + 't'))
+            nodes[0].text = 'Ному насаб'
+            for node in nodes[1:]: node.text = ''
+            for number, row in enumerate(table.findall(W + 'tr')[1:], offset + 1):
+                if prefix == 'student' and offset == 0:
+                    paragraph = row.findall(W + 'tc')[0].find(W + 'p')
+                    props = paragraph.find(W + 'pPr')
+                    for tag in ('numPr',):
+                        node = props.find(W + tag) if props is not None else None
+                        if node is not None: props.remove(node)
+                    if props is not None:
+                        etree.SubElement(etree.SubElement(props, W + 'numPr'), W + 'numId').set(W + 'val', '0')
+                    run = etree.SubElement(paragraph, W + 'r')
+                    font = props.find(W + 'rPr') if props is not None else None
+                    if font is not None: run.append(deepcopy(font))
+                    etree.SubElement(run, W + 't').text = f'{number}.'
+                if prefix == 'student':
+                    props = row.find(W + 'trPr')
+                    if props is None:
+                        props = etree.Element(W + 'trPr'); row.insert(0, props)
+                    height = props.find(W + 'trHeight')
+                    if height is None: height = etree.SubElement(props, W + 'trHeight')
+                    height.set(W + 'val', '450')
+                    height.set(W + 'hRule', 'atLeast')
+                cell = row.findall(W + 'tc')[1]
+                wrap_paragraph(cell.find(W + 'p'), f'{prefix}_{number}', True)
+                for paragraph in cell.findall(W + 'p')[1:]:
+                    # Empty extra paragraphs are source page furniture; preserve them.
+                    if ''.join(paragraph.itertext()):
+                        for node in paragraph.iter(W + 't'): node.text = ''
+        for paragraph in root.iter(W + 'p'):
+            if 'Ба ҳайъати' in ''.join(paragraph.itertext()):
+                for run in list(paragraph.findall(W + 'r')):
+                    text = ''.join(run.itertext())
+                    if text in ('______________', '________'):
+                        tag = 'group' if len(text) == 14 else 'date'
+                        props = run.find(W + 'rPr')
+                        if props is None:
+                            props = etree.Element(W + 'rPr'); run.insert(0, props)
+                        etree.SubElement(props, W + 'u').set(W + 'val', 'single')
+                        if tag == 'group':
+                            spacer = etree.Element(W + 'r')
+                            etree.SubElement(spacer, W + 't').text = ' '
+                            spacer[0].set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                            paragraph.insert(paragraph.index(run), spacer)
+                        else:
+                            spacer = etree.Element(W + 'r')
+                            etree.SubElement(spacer, W + 't').text = ' '
+                            spacer[0].set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                            paragraph.insert(paragraph.index(run), spacer)
+                        wrap_run(paragraph, run, tag)
+        for row, tag in zip(tables[3].findall(W + 'tr')[1:], ('curator', 'deputy')):
+            paragraph = row.findall(W + 'tc')[2].findall(W + 'p')[-1]
+            wrap_paragraph(paragraph, tag)
+        with ZipFile(BASE / 'template_talabot.docx', 'w') as target:
+            for item in source.infolist():
+                data = etree.tostring(root, encoding='UTF-8', xml_declaration=True, standalone=True) if item.filename == 'word/document.xml' else source.read(item.filename)
+                target.writestr(item, data)
 
 if __name__ == '__main__':
-    build()
+    build(Path(sys.argv[1]))
