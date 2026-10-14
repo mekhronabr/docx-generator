@@ -10,7 +10,7 @@ from openpyxl.styles import Font
 from openpyxl.cell.rich_text import CellRichText, TextBlock
 from openpyxl.cell.text import InlineFont
 
-from talabot import W, batch_settings, display_date, generate_batch, read_batch_excel
+from talabot import W, TEMPLATE, batch_settings, display_date, generate, generate_batch, read_batch_excel
 
 
 class BatchTests(unittest.TestCase):
@@ -90,6 +90,28 @@ class BatchTests(unittest.TestCase):
     def test_excel_iso_dates_keep_day_and_month(self):
         self.assertEqual(display_date('2025-10-11 00:00:00'), '11.10.2025')
         self.assertEqual(display_date('11.10.2025'), '11.10.2025')
+
+    def test_optional_date_stays_empty(self):
+        for value in ('', '  ', None, float('nan')):
+            self.assertEqual(display_date(value), '')
+        df = self.source().drop(columns=['Дата'])
+        settings = batch_settings(df)
+        for value in ('', None, float('nan')):
+            settings['Дата'] = value
+            with ZipFile(BytesIO(generate_batch(df, settings))) as document:
+                root = etree.fromstring(document.read('word/document.xml'))
+                self.assertNotIn('10.10.2025', ''.join(root.itertext()))
+                self.assertNotIn('NaT', ''.join(root.itertext()))
+        data = dict(form_code='ФЭ_11', group='Группа/1', curator='Куратор', deputy='Заместитель', students=['Студент'])
+        with ZipFile(TEMPLATE) as template:
+            source_root = etree.fromstring(template.read('word/document.xml'))
+        control = next(c for c in source_root.iter(W + 'sdt') if c.find(W + 'sdtPr/' + W + 'tag').get(W + 'val') == 'date')
+        paragraph_index = list(source_root.iter(W + 'p')).index(control.getparent())
+        with ZipFile(BytesIO(generate(data))) as document:
+            root = etree.fromstring(document.read('word/document.xml'))
+        paragraph = list(root.iter(W + 'p'))[paragraph_index]
+        self.assertTrue(any(t.text is None for t in paragraph.iter(W + 't')))
+        self.assertEqual(len(list(root.iter(W + 'sdt'))), 0)
 
 
 if __name__ == '__main__':

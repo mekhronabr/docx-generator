@@ -21,6 +21,8 @@ def lines(text):
 
 
 def display_date(value):
+    if pd.isna(value) or not str(value).strip():
+        return ''
     text = str(value).strip()
     return pd.to_datetime(text, dayfirst=not bool(re.match(r'^\d{4}-\d{2}-\d{2}', text)), errors='raise').strftime('%d.%m.%Y')
 
@@ -99,10 +101,11 @@ def render_root(data, template_bytes):
         raise ValueError('В основном списке должно быть от 1 до 40 студентов.')
     if len(absent) > len(absence_tags):
         raise ValueError(f'В списке отсутствующих допустимо до {len(absence_tags)} студентов — по числу мест в шаблоне.')
-    for field in ('form_code', 'group', 'date', 'curator', 'deputy'):
+    for field in ('form_code', 'group', 'curator', 'deputy'):
         if not data.get(field, '').strip():
-            raise ValueError('Заполните код факультета, группу, дату и ФИО ответственных.')
-    slots = {key: data[key] for key in ('form_code', 'group', 'date', 'curator', 'deputy')}
+            raise ValueError('Заполните код факультета, группу и ФИО ответственных.')
+    slots = {key: data[key] for key in ('form_code', 'group', 'curator', 'deputy')}
+    slots['date'] = data.get('date', '').strip()
     slots.update({f'student_{i + 1}': students[i] if i < len(students) else '' for i in range(40)})
     slots.update({tag: absent[i] if i < len(absent) else '' for i, tag in enumerate(absence_tags)})
     if any(re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', value) for value in slots.values()):
@@ -191,7 +194,7 @@ def main():
     imported = ''
     imported_formats = {}
     metadata_formats = {}
-    defaults = dict(form_code='ФЭ_11.', group='1_53.01.05тб', curator='', deputy='', date='10.10.2025', absent='')
+    defaults = dict(form_code='ФЭ_11.', group='1_53.01.05тб', curator='', deputy='', date='', absent='')
     if upload is not None:
         try:
             if upload.size > 20 * 1024 * 1024:
@@ -231,7 +234,7 @@ def main():
     with st.form('talabot_form'):
         code = st.text_input('Код факультета', value=defaults['form_code'])
         group = st.text_input('Группа', value=defaults['group'])
-        when = st.date_input('Дата ознакомления', value=pd.to_datetime(defaults['date'], format='%d.%m.%Y').date())
+        when = st.date_input('Дата ознакомления (необязательно)', value=pd.to_datetime(defaults['date'], format='%d.%m.%Y').date() if defaults['date'] else None)
         curator = st.text_input('Фамилия и имя — куратори гурӯҳи академӣ', value=defaults['curator'])
         deputy = st.text_input('Фамилия и имя — муовини директор оид ба тарбия', value=defaults['deputy'])
         students = st.text_area('Фамилии и имена студентов (до 40)', value=imported, height=300)
@@ -247,7 +250,7 @@ def main():
     if submitted:
         st.session_state.pop('talabot_result', None)
         try:
-            data = dict(form_code=code.strip(), group=group.strip(), date=when.strftime('%d.%m.%Y'), curator=curator.strip(), deputy=deputy.strip(), students=lines(students), absent=lines(absent))
+            data = dict(form_code=code.strip(), group=group.strip(), date=when.strftime('%d.%m.%Y') if when else '', curator=curator.strip(), deputy=deputy.strip(), students=lines(students), absent=lines(absent))
             data['formats'] = {tag: metadata_formats.get(tag) or [{'text': data[tag], 'style': manual_styles[tag]}] for tag in ('form_code', 'group', 'date', 'curator', 'deputy')}
             for field, prefix in [('students', 'student'), ('absent', 'absent')]:
                 for i, name in enumerate(data[field], 1):
@@ -383,7 +386,7 @@ def generate_batch(df, settings, progress=lambda done, total: None):
     for index, item in enumerate(settings.to_dict('records'), 1):
         group = item['Группа']
         rows = df.loc[df['Группа'] == group]
-        missing = [field for field in BATCH_FIELDS if pd.isna(item[field]) or not str(item[field]).strip()]
+        missing = [field for field in BATCH_FIELDS if field != 'Дата' and (pd.isna(item[field]) or not str(item[field]).strip())]
         if missing:
             raise ValueError(f'Группа {group}: заполните ' + ', '.join(missing))
         when = display_date(item['Дата'])
@@ -426,7 +429,7 @@ def generate_batch(df, settings, progress=lambda done, total: None):
 
 def batch_main():
     st.write('Загрузите Excel со всеми группами. Одна строка — один студент; колонка группы обязательна.')
-    st.caption('Данные ответственных можно заполнить в Excel или в настройках ниже. «Отсутствует»: да/нет; отсутствующий остаётся и в основном списке.')
+    st.caption('Данные ответственных можно заполнить в Excel или в настройках ниже. Дату можно оставить пустой. «Отсутствует»: да/нет; отсутствующий остаётся и в основном списке.')
     upload = st.file_uploader('Excel для нескольких групп (.xlsx)', type=['xlsx'], key='talabot_batch_excel')
     if upload is None:
         return
