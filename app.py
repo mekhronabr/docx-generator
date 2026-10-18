@@ -244,7 +244,7 @@ def generate_part(rows, template_bytes, output, progress=lambda n, total: None):
 def main():
     st.set_page_config(page_title='Генератор Огоҳинома', page_icon='📄')
     st.title('Макрос')
-    template_kind = st.selectbox('Шаблон документа', ['Огоҳинома', 'Талабот'])
+    template_kind = st.selectbox('Шаблон документа', ['Огоҳинома', 'Талабот'], index=1 if st.query_params.get('batch_job') else 0)
     if template_kind == 'Талабот':
         # Streamlit reruns this entrypoint on deploy, but imported modules may
         # stay in sys.modules. Reload the stateless renderer with its template.

@@ -184,7 +184,7 @@ def main():
     excel_example = BytesIO()
     pd.DataFrame(columns=['Ному насаби донишҷӯ', 'Гурӯҳ', 'Код факультета', 'Дата', 'ФИО Куратора', 'ФИО Заместителя', 'Отсутствует']).to_excel(excel_example, index=False)
     st.download_button('Скачать пустую таблицу Excel для Талабот', excel_example.getvalue(), file_name='Талабот_ҷадвали_холӣ.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', on_click='ignore')
-    mode = st.radio('Режим генерации', ['Одна группа', 'Несколько групп'], horizontal=True)
+    mode = st.radio('Режим генерации', ['Одна группа', 'Несколько групп'], index=1 if st.query_params.get('batch_job') else 0, horizontal=True)
     from examples_ui import show_examples
     show_examples('talabot_batch' if mode == 'Несколько групп' else 'talabot', TEMPLATE)
     if mode == 'Несколько групп':
@@ -427,40 +427,90 @@ def generate_batch(df, settings, progress=lambda done, total: None):
     return write_package(combined, template_bytes)
 
 
+@st.fragment(run_every=2)
+def batch_progress(token):
+    import batch_jobs as jobs
+    state = jobs.load(token)
+    st.progress(state['done'] / state['total'])
+    st.write(f"Готово групп: {state['done']} из {state['total']}.")
+    for filename in state['results']:
+        path = jobs.directory(token) / filename
+        st.download_button(f'Скачать {filename}', data=lambda path=path: path.read_bytes(),
+                           file_name=filename, key=f'{token}_{filename}',
+                           mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                           on_click='ignore')
+    if state['error']:
+        st.error(state['error'])
+    if state['done'] == state['total']:
+        st.success('Все группы обработаны. Готовые файлы сохранены для скачивания.')
+    elif state['running']:
+        if st.button('Приостановить после текущей партии'):
+            with jobs.locked(token) as acquired:
+                if acquired:
+                    current = jobs.load(token)
+                    current['running'] = False
+                    jobs.save(token, current)
+            st.rerun()
+        with st.spinner('Создаётся следующая партия…'):
+            jobs.process_next(token, generate_batch)
+    elif st.button('Продолжить обработку', type='primary'):
+        with jobs.locked(token) as acquired:
+            if acquired:
+                current = jobs.load(token)
+                current.update(running=True, error='')
+                jobs.save(token, current)
+        st.rerun()
+
+
 def batch_main():
-    st.write('Загрузите Excel со всеми группами. Одна строка — один студент; колонка группы обязательна.')
-    st.caption('Данные ответственных можно заполнить в Excel или в настройках ниже. Дату можно оставить пустой. «Отсутствует»: да/нет; отсутствующий остаётся и в основном списке.')
-    upload = st.file_uploader('Excel для нескольких групп (.xlsx)', type=['xlsx'], key='talabot_batch_excel')
-    if upload is None:
-        return
-    try:
-        df = read_batch_excel(upload.getvalue())
-        settings = batch_settings(df)
-    except Exception as error:
-        st.error(f'Не удалось прочитать Excel: {error}')
-        return
+    import batch_jobs as jobs
+    st.write('Загрузите Excel со всеми группами. Результаты выдаются отдельными Word партиями по 20 групп.')
+    st.caption('Данные и прогресс сохраняются на сервере. После обновления этой страницы обработка продолжится. Сохраните адрес страницы для возврата к заданию.')
+    token = st.query_params.get('batch_job', '')
+    state = None
+    if token:
+        try:
+            state = jobs.load(token)
+        except (ValueError, FileNotFoundError):
+            st.warning('Сохранённое задание недоступно. Загрузите Excel заново.')
+    if state is not None:
+        st.info(f"Сохранённый файл: {state['filename']}")
+        if st.button('Загрузить другой файл'):
+            del st.query_params['batch_job']
+            st.session_state.pop('talabot_batch_excel', None)
+            st.rerun()
+        if state.get('batch_size'):
+            batch_progress(token)
+            return
+        df, settings = state['pending'], state['settings']
+    else:
+        upload = st.file_uploader('Excel для нескольких групп (.xlsx)', type=['xlsx'], key='talabot_batch_excel')
+        if upload is None:
+            return
+        try:
+            df = read_batch_excel(upload.getvalue())
+            settings = batch_settings(df)
+            token = jobs.create(upload.name, df, settings)
+            st.query_params['batch_job'] = token
+        except Exception as error:
+            st.error(f'Не удалось прочитать Excel: {error}')
+            return
     selected = st.multiselect('Группы для генерации', settings['Группа'].tolist(), default=settings['Группа'].tolist())
     if not selected:
         st.info('Выберите хотя бы одну группу.')
         return
-    df = df.loc[df['Группа'].isin(selected)]
     settings = settings.loc[settings['Группа'].isin(selected)]
-    st.info(f'Студентов: {len(df)}. Групп: {len(settings)}. Результат — один Word.')
+    st.info(f'Групп: {len(settings)}. Каждая группа начинается с новой страницы в своей партии.')
     with st.form('talabot_batch_form'):
-        st.write('Настройки каждого документа')
         edited = st.data_editor(settings, hide_index=True, disabled=['Группа'], num_rows='fixed', key='talabot_batch_settings')
-        submitted = st.form_submit_button('Сгенерировать общий документ', type='primary')
-    identity = hashlib.sha256(upload.getvalue() + edited.to_csv(index=False).encode()).hexdigest()
-    if st.session_state.get('talabot_batch_identity') != identity:
-        st.session_state.pop('talabot_batch_result', None)
+        size = int(st.number_input('Групп в одной партии', min_value=1, max_value=100, value=20))
+        submitted = st.form_submit_button('Начать обработку партиями', type='primary')
     if submitted:
-        st.session_state.pop('talabot_batch_result', None)
-        bar = st.progress(0.0)
-        try:
-            st.session_state.talabot_batch_result = generate_batch(df, edited, lambda done, total: bar.progress(done / total))
-            st.session_state.talabot_batch_identity = identity
-            st.success(f'Готов один Word для {len(edited)} групп.')
-        except Exception as error:
-            st.error(f'Не удалось создать документы: {error}')
-    if st.session_state.get('talabot_batch_result'):
-        st.download_button('Скачать общий Word', st.session_state.talabot_batch_result, file_name='Талабот_все_группы.docx', mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document', on_click='ignore')
+        with jobs.locked(token) as acquired:
+            if acquired:
+                state = jobs.load(token)
+                pending = df.loc[df['Группа'].isin(selected)].copy()
+                pending.attrs['formats'] = {k: v for k, v in df.attrs.get('formats', {}).items() if k[0] in pending.index}
+                state.update(pending=pending, settings=edited, total=len(edited), batch_size=size, running=True)
+                jobs.save(token, state)
+        st.rerun()
