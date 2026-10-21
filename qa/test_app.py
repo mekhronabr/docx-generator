@@ -57,6 +57,10 @@ def run():
         assert 'Энергетика & <автоматика>' in text
         assert len(root.findall('.//' + app.W + 'sectPr')) == 1
         assert len(root.findall('.//' + app.W + 'pageBreakBefore')) == 2
+        size = root.find('.//' + app.W + 'pgSz')
+        assert (size.get(app.W + 'w'), size.get(app.W + 'h')) == ('11906', '16838')
+        assert not root.findall('.//' + app.W + 'tblpPr')
+        assert len(root.findall('.//' + app.W + 'tbl')) == 9
         assert z.testzip() is None
         for r in root.iter(app.W + 'r'):
             value = ''.join(r.itertext(app.W + 't'))

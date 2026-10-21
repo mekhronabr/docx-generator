@@ -143,8 +143,50 @@ def render_student(template_bytes, row, path):
     # У каждого задания свой DocxTemplate, никаких общих изменяемых объектов.
     doc = DocxTemplate(BytesIO(template_bytes))
     doc.render(context(row), jinja_env=Environment(undefined=StrictUndefined), autoescape=True)
+    apply_print_layout(doc.docx.element)
     path.write_bytes(etree.tostring(doc.docx.element, encoding='UTF-8', xml_declaration=True))
     return path
+
+
+def apply_print_layout(root):
+    """Reserve room for filled names, specialties and all three signature tables."""
+    section = root.find(W + 'body').find(W + 'sectPr')
+    size = section.find(W + 'pgSz')
+    size.set(W + 'w', '11906')  # A4, portrait
+    size.set(W + 'h', '16838')
+    margins = section.find(W + 'pgMar')
+    for edge, value in [('top', '850'), ('bottom', '850'),
+                        ('left', '1021'), ('right', '1021')]:
+        margins.set(W + edge, value)
+    # Floating signature tables let the following acknowledgement wrap beside
+    # them. Keep them in document order so labels stay above their signatures.
+    for positioning in root.iter(W + 'tblpPr'):
+        positioning.getparent().remove(positioning)
+    body = root.find(W + 'body')
+    tables = body.findall(W + 'tbl')
+    if len(tables) == 3:
+        for paragraph in list(body.findall(W + 'p')):
+            text = ''.join(paragraph.itertext(W + 't'))
+            if text.startswith('Огоҳномаро гирифтам'):
+                paragraph.addprevious(tables[0])
+            elif text.startswith('Бо мазмуни огоҳинома'):
+                paragraph.addprevious(tables[1])
+    for paragraph in root.iter(W + 'p'):
+        props = paragraph.find(W + 'pPr')
+        if props is None:
+            props = etree.Element(W + 'pPr')
+            paragraph.insert(0, props)
+        spacing = props.find(W + 'spacing')
+        if spacing is None:
+            spacing = etree.SubElement(props, W + 'spacing')
+        for key, value in [('before', '0'), ('after', '0'),
+                           ('line', '240'), ('lineRule', 'auto'),
+                           ('beforeAutospacing', '0'), ('afterAutospacing', '0')]:
+            spacing.set(W + key, value)
+        # Empty separators must not consume full body-text lines.
+        if next(paragraph.iter(W + 't'), None) is None:
+            spacing.set(W + 'line', '40')
+            spacing.set(W + 'lineRule', 'exact')
 
 
 def rendering_template(template_bytes):
