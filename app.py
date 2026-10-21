@@ -155,8 +155,8 @@ def apply_print_layout(root):
     size.set(W + 'w', '11906')  # A4, portrait
     size.set(W + 'h', '16838')
     margins = section.find(W + 'pgMar')
-    for edge, value in [('top', '850'), ('bottom', '850'),
-                        ('left', '1021'), ('right', '1021')]:
+    for edge, value in [('top', '567'), ('bottom', '680'),
+                        ('left', '680'), ('right', '680')]:
         margins.set(W + edge, value)
     # Floating signature tables let the following acknowledgement wrap beside
     # them. Keep them in document order so labels stay above their signatures.
@@ -164,6 +164,20 @@ def apply_print_layout(root):
         positioning.getparent().remove(positioning)
     body = root.find(W + 'body')
     tables = body.findall(W + 'tbl')
+    for table in tables:
+        grid = table.find(W + 'tblGrid')
+        if grid is not None:
+            columns = grid.findall(W + 'gridCol')
+            total_width = sum(int(column.get(W + 'w')) for column in columns)
+            if total_width:
+                scale = (11906 - 2 * 680) / total_width
+                for element in list(columns) + table.findall('.//' + W + 'tcW'):
+                    element.set(W + 'w', str(round(int(element.get(W + 'w')) * scale)))
+                columns[-1].set(W + 'w', str(10546 - sum(int(column.get(W + 'w')) for column in columns[:-1])))
+                width = table.find(W + 'tblPr').find(W + 'tblW')
+                if width is not None:
+                    width.set(W + 'w', '10546')
+                    width.set(W + 'type', 'dxa')
     if len(tables) == 3:
         for paragraph in list(body.findall(W + 'p')):
             text = ''.join(paragraph.itertext(W + 't'))
@@ -185,8 +199,45 @@ def apply_print_layout(root):
             spacing.set(W + key, value)
         # Empty separators must not consume full body-text lines.
         if next(paragraph.iter(W + 't'), None) is None:
-            spacing.set(W + 'line', '40')
+            spacing.set(W + 'line', '100')
             spacing.set(W + 'lineRule', 'exact')
+            continue
+        text = ''.join(paragraph.itertext(W + 't')).strip()
+        if text.startswith('Ба волидайни'):
+            for node in paragraph.iter(W + 't'):
+                if node.text and node.text.endswith('донишҷӯ'):
+                    node.text += ' '
+                    node.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        in_table = any(parent.tag == W + 'tc' for parent in paragraph.iterancestors())
+        centered = False
+        if not in_table:
+            alignment = props.find(W + 'jc')
+            centered = alignment is not None and alignment.get(W + 'val') == 'center'
+            if not centered:
+                if alignment is None:
+                    alignment = etree.SubElement(props, W + 'jc')
+                alignment.set(W + 'val', 'both' if not text.startswith(('Ба волидайни', 'Огоҳномаро', 'Бо мазмуни')) else 'left')
+                spacing.set(W + 'line', '260')
+                spacing.set(W + 'after', '40' if not text.startswith('-') else '0')
+            if text == 'ОГОҲИНОМА':
+                spacing.set(W + 'before', '100')
+                spacing.set(W + 'after', '160')
+            elif text.startswith(('Ба волидайни', 'Огоҳномаро', 'Бо мазмуни')):
+                spacing.set(W + 'before', '100')
+                spacing.set(W + 'after', '100')
+        for run in paragraph.findall(W + 'r'):
+            run_props = run.find(W + 'rPr')
+            if run_props is None:
+                run_props = etree.Element(W + 'rPr')
+                run.insert(0, run_props)
+            for tag in ('sz', 'szCs'):
+                font_size = run_props.find(W + tag)
+                if font_size is None:
+                    font_size = etree.SubElement(run_props, W + tag)
+                # Match the photographed form's readable type and hierarchy.
+                caption = in_table and (any(word in text for word in ('имзо', 'телефони', 'ному насаби')) or text == 'сана')
+                half_points = 32 if text == 'ОГОҲИНОМА' else (20 if caption else (23 if centered else 26))
+                font_size.set(W + 'val', str(half_points))
 
 
 def rendering_template(template_bytes):

@@ -9,6 +9,14 @@ Only normalize spec tag whitespace if present as a single text node.
 Output template.docx preserves all package parts; final assembly repeats body XML,
 adds pageBreakBefore at first paragraph per student except first, reuses all assets.
 No drawings, hyperlinks, comments, bookmarks, footnote/endnote references in body.
-No template redesign, no automatic shrink-to-fit. Long values can occupy extra pages.
+Updated 2026-10-21 at the user's request: the photographed original now controls
+print layout. A4 with 10 mm top, 12 mm side/bottom margins; Times New Roman
+13 pt body, 16 pt title, 11.5 pt institutional header, 10 pt signature captions.
+Preserve text, emphasis, underlining and the three signature groups. Tables stay
+inline in semantic order and span the text width. Body text is justified, with
+space above/below the title and acknowledgement blocks. No content is removed.
+QA: three generated students render to three pages; the longest notice by text
+length in the supplied 561-notice document (index 248) renders to one page.
+Rendered page images inspected in /private/tmp/ogoh-photo/final-batch and final-long.
 
 Reference SHA256: c96066f599f4cd2f93203e34d484bfe2b7f122fcc38d09198c04973e5c821ae5

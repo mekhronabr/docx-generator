@@ -61,6 +61,10 @@ def run():
         assert (size.get(app.W + 'w'), size.get(app.W + 'h')) == ('11906', '16838')
         assert not root.findall('.//' + app.W + 'tblpPr')
         assert len(root.findall('.//' + app.W + 'tbl')) == 9
+        # Reapplying layout must not grow signature tables or move their blocks.
+        body = root.find(app.W + 'body')
+        for table in body.findall(app.W + 'tbl'):
+            assert sum(int(col.get(app.W + 'w')) for col in table.findall(app.W + 'tblGrid/' + app.W + 'gridCol')) == 10546
         assert z.testzip() is None
         for r in root.iter(app.W + 'r'):
             value = ''.join(r.itertext(app.W + 't'))
